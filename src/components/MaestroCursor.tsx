@@ -1,340 +1,118 @@
-'use client';
-
 /**
- * MaestroCursor.tsx v2.11 FINAL - Complete Working Version
- * Date: January 29th, 2026
+ * MaestroCursor v3.0 - ICursorHandler Implementation (CLEAN)
+ * Date: January 31st, 2026
  * 
- * 🎉 FULLY FUNCTIONAL:
- * ✅ NESTED structure (visualBounds.x) - correct accessor pattern
- * ✅ Beat Y positioning (310) - cursor at staff level
- * ✅ Position listener - moves on seeks
- * ✅ Top overhang (20px) - white dot above staff
- * ✅ Bottom overhang (12px) - extends below staff (Songsterr style)
+ * 🔥 ZERO AlphaTab imports - pure local types only!
  */
 
-import React, { useEffect, useState } from 'react';
+'use client';
 
-interface MaestroCursorProps {
-    api: any;
-    isRendered: boolean;
-    isPlaying: boolean;
-    renderCycle?: number;
+// ========== LOCAL TYPE DEFINITIONS (NO IMPORTS!) ==========
+
+interface Beat {
+    absolutePlaybackStart: number;
+    [key: string]: any;
 }
 
-interface CursorPosition {
+interface VisualBounds {
     x: number;
     y: number;
-    height: number;
-    visible: boolean;
+    w: number;
+    h: number;
 }
 
-export const MaestroCursor: React.FC<MaestroCursorProps> = ({
-    api,
-    isRendered,
-    isPlaying,
-    renderCycle = 0,
-}) => {
-    const [cursorPos, setCursorPos] = useState<CursorPosition>({
-        x: 0,
-        y: 0,
-        height: 99,
-        visible: false,
-    });
+interface ICursorHandler {
+    update(beat: Beat | null, visualBounds: VisualBounds | null): void;
+}
 
-    useEffect(() => {
-        if (!api || !isRendered) {
-            console.log('⏳ MaestroCursor v2.11: Waiting...');
+// ========== MAESTRO CURSOR CLASS ==========
+
+export class MaestroCursor implements ICursorHandler {
+    private element: HTMLElement;
+    private cursorWidth = 14;
+    private topOverhang = 20;
+    private bottomOverhang = 12;
+    private lastBeatTick = 0;
+    private svgRendered = false;
+
+    constructor(container: HTMLElement) {
+        console.log('🎸 MaestroCursor v3.0: Initializing...');
+
+        // Create cursor element
+        this.element = document.createElement('div');
+        this.element.id = 'maestro-cursor-v3';
+        this.element.className = 'maestro-cursor-icursor';
+
+        // Styles
+        this.element.style.position = 'absolute';
+        this.element.style.top = '0';
+        this.element.style.left = '0';
+        this.element.style.pointerEvents = 'none';
+        this.element.style.zIndex = '99999';
+        this.element.style.willChange = 'transform';
+        this.element.style.width = `${this.cursorWidth}px`;
+        this.element.style.overflow = 'visible';
+        this.element.style.visibility = 'hidden';
+        this.element.style.opacity = '0';
+
+        container.appendChild(this.element);
+        console.log('✅ MaestroCursor v3.0: Element created');
+    }
+
+    /**
+     * ICursorHandler method - called by AlphaTab engine
+     */
+    update(beat: Beat | null, visualBounds: VisualBounds | null): void {
+        console.log('🔥 UPDATE CALLED!', {
+            tick: beat?.absolutePlaybackStart,
+            x: visualBounds?.x,
+            y: visualBounds?.y
+        });
+
+        if (!beat || !visualBounds) {
+            this.element.style.visibility = 'hidden';
+            this.element.style.opacity = '0';
             return;
         }
 
-        if (!api.renderer?.boundsLookup?.staffSystems) {
-            console.log('⏳ MaestroCursor v2.11: BoundsLookup not ready');
-            return;
+        // Show cursor
+        this.element.style.visibility = 'visible';
+        this.element.style.opacity = '1';
+
+        // 🎯 CENTERING FIX
+        const noteCenterX = visualBounds.x + (visualBounds.w / 2);
+        const finalX = noteCenterX - (this.cursorWidth / 2);
+
+        // Calculate dimensions
+        const totalHeight = visualBounds.h + this.topOverhang + this.bottomOverhang;
+        const finalY = visualBounds.y - this.topOverhang;
+
+        // Apply position (GPU accelerated)
+        this.element.style.transform = `translate3d(${finalX}px, ${finalY}px, 0px)`;
+        this.element.style.height = `${totalHeight}px`;
+
+        // Render SVG once
+        if (!this.svgRendered) {
+            this.renderSVG(totalHeight, visualBounds.h);
+            this.svgRendered = true;
         }
 
-        console.log('🎸 MaestroCursor v2.11: Position listener enabled');
-
-        let animationFrameId: number | null = null;
-        let currentX = 0;
-        let currentY = 0;
-        let targetX = 0;
-        let targetY = 0;
-        let currentHeight = 99;
-        let currentBeat: any = null;
-        let lastTickPosition = api.tickPosition || 0;
-
-        /**
-         * 🎯 Extract coordinates - USE BEAT Y NOT SYSTEM Y!
-         * AlphaTab 1.9.0-alpha uses NESTED objects: visualBounds.x (not visualBounds_x)
-         */
-        const extractCoordinates = (beat: any) => {
-            if (!beat || !api?.renderer?.boundsLookup) {
-                console.warn('⚠️ v2.11: No beat or boundsLookup');
-                return null;
-            }
-
-            try {
-                const beatBounds = api.renderer.boundsLookup.findBeat(beat);
-                if (!beatBounds) {
-                    console.warn('⚠️ v2.11: findBeat returned null');
-                    return null;
-                }
-
-                // 🎯 NESTED ACCESSOR (AlphaTab 1.9.0-alpha structure)
-                const x = beatBounds.visualBounds?.x
-                    ?? beatBounds.realBounds?.x
-                    ?? beatBounds.x
-                    ?? 0;
-
-                // 🔥 CRITICAL: Use BEAT Y (310) not system Y (262)!
-                const y = beatBounds.visualBounds?.y
-                    ?? beatBounds.realBounds?.y
-                    ?? beatBounds.y
-                    ?? 0;
-
-                const h = beatBounds.visualBounds?.h
-                    ?? beatBounds.realBounds?.h
-                    ?? beatBounds.h
-                    ?? 99;
-
-                console.log(`✅ v2.11: Extracted X=${x.toFixed(1)}, Y=${y.toFixed(1)}, H=${h}`);
-
-                return { x, y, height: h };
-
-            } catch (err) {
-                console.error('❌ v2.11: Extract error:', err);
-                return null;
-            }
-        };
-
-        /**
-         * Update cursor position
-         */
-        const updateFromBeat = (beat: any, instant: boolean = false) => {
-            if (!beat) return;
-
-            const coords = extractCoordinates(beat);
-            if (!coords) {
-                console.warn('⚠️ v2.11: No coordinates extracted');
-                return;
-            }
-
-            console.log(`🎯 v2.11: Setting cursor to X=${coords.x.toFixed(1)}, Y=${coords.y.toFixed(1)}, H=${coords.height}`);
-
-            if (instant) {
-                currentX = coords.x;
-                currentY = coords.y;
-                targetX = coords.x;
-                targetY = coords.y;
-                currentHeight = coords.height;
-
-                setCursorPos({
-                    x: coords.x,
-                    y: coords.y,
-                    height: coords.height,
-                    visible: true,
-                });
-
-                console.log(`⚡ v2.11: Snapped to X=${coords.x.toFixed(1)}`);
-            } else {
-                targetX = coords.x;
-                targetY = coords.y;
-                currentHeight = coords.height;
-            }
-        };
-
-        /**
-         * Animation loop (60fps smooth interpolation)
-         */
-        const smoothUpdate = () => {
-            const lerp = 0.3;
-
-            currentX += (targetX - currentX) * lerp;
-            currentY += (targetY - currentY) * lerp;
-
-            setCursorPos({
-                x: currentX,
-                y: currentY,
-                height: currentHeight,
-                visible: true,
-            });
-
-            animationFrameId = requestAnimationFrame(smoothUpdate);
-        };
-
-        /**
-         * 🎵 Beat changed (during playback)
-         */
-        const handleBeatChanged = (beat: any) => {
-            if (!beat) return;
-            console.log('🎵 v2.11: Beat changed');
-            currentBeat = beat;
-            updateFromBeat(beat, false);
-        };
-
-        /**
-         * 🎯 Position changed (manual seeks)
-         */
-        const handlePositionChanged = (e: any) => {
-            const currentTick = e?.currentTick ?? api.tickPosition;
-            console.log(`🎯 v2.11: Position changed to tick ${currentTick}`);
-
-            if (api.score) {
-                const trackIndices = api.tracks
-                    ? new Set(api.tracks.map((t: any) => t.index))
-                    : new Set([0]);
-
-                const tickCache = (api as any).tickCache;
-
-                if (tickCache) {
-                    const beatResult = tickCache.findBeat(trackIndices, currentTick);
-
-                    if (beatResult?.beat) {
-                        console.log('✅ v2.11: Found beat at new position');
-                        currentBeat = beatResult.beat;
-                        updateFromBeat(beatResult.beat, true);
-                    } else {
-                        console.warn('⚠️ v2.11: No beat at tick', currentTick);
-                    }
-                }
-            }
-        };
-
-        /**
-         * 🔄 Render started
-         */
-        const handleRenderStarted = () => {
-            console.log('🔄 v2.11: Render started');
-        };
-
-        /**
-         * 🎯 Seek detection (polling for manual seeks)
-         * This catches seeks that don't trigger positionChanged
-         */
-        const checkForSeeks = () => {
-            const currentTick = api.tickPosition;
-            const tickDelta = Math.abs(currentTick - lastTickPosition);
-
-            // Detect significant jumps (>500 ticks = likely a seek)
-            if (tickDelta > 500) {
-                console.log(`🎯 v2.11: Seek detected! Δ=${tickDelta}`);
-                handlePositionChanged({ currentTick });
-            }
-
-            lastTickPosition = currentTick;
-        };
-
-        // Start animation
-        animationFrameId = requestAnimationFrame(smoothUpdate);
-
-        // Attach listeners
-        if (api.playedBeatChanged) {
-            api.playedBeatChanged.on(handleBeatChanged);
-            console.log('✅ v2.11: playedBeatChanged listener attached');
+        // Debug logging
+        if (beat.absolutePlaybackStart !== this.lastBeatTick) {
+            this.lastBeatTick = beat.absolutePlaybackStart;
+            console.log(`[Maestro v3.0] Tick: ${beat.absolutePlaybackStart} | ` +
+                `X=${finalX.toFixed(1)}, Y=${visualBounds.y.toFixed(1)}, ` +
+                `Center=${noteCenterX.toFixed(1)}`);
         }
 
-        if (api.playerPositionChanged) {
-            api.playerPositionChanged.on(handlePositionChanged);
-            console.log('✅ v2.11: playerPositionChanged listener attached');
-        }
+        this.updateDebugLabel(finalX, visualBounds.y, visualBounds.h, visualBounds.w);
+    }
 
-        if (api.renderStarted) {
-            api.renderStarted.on(handleRenderStarted);
-        }
-
-        // Start seek polling (100ms interval)
-        const seekPollInterval = setInterval(checkForSeeks, 100);
-        console.log('✅ v2.11: Seek polling started');
-
-        // 🎯 INITIALIZATION - 300ms delay
-        const initTimer = setTimeout(() => {
-            console.log('🎯 v2.11: Initializing cursor (300ms delay)...');
-
-            if (api.score) {
-                const trackIndices = api.tracks
-                    ? new Set(api.tracks.map((t: any) => t.index))
-                    : new Set([0]);
-
-                const tickCache = (api as any).tickCache;
-
-                if (tickCache) {
-                    const beatResult = tickCache.findBeat(trackIndices, 0);
-
-                    if (beatResult?.beat) {
-                        console.log('✅ v2.11: Found beat at tick 0');
-                        currentBeat = beatResult.beat;
-                        updateFromBeat(beatResult.beat, true);
-                    } else {
-                        console.warn('⚠️ v2.11: No beat at tick 0');
-                    }
-                }
-            }
-        }, 300);
-
-        // Cleanup
-        return () => {
-            console.log('🧹 v2.11: Cleanup');
-
-            clearTimeout(initTimer);
-            clearInterval(seekPollInterval);
-
-            if (api.playedBeatChanged) {
-                api.playedBeatChanged.off(handleBeatChanged);
-            }
-
-            if (api.playerPositionChanged) {
-                api.playerPositionChanged.off(handlePositionChanged);
-            }
-
-            if (api.renderStarted) {
-                api.renderStarted.off(handleRenderStarted);
-            }
-
-            if (animationFrameId !== null) {
-                cancelAnimationFrame(animationFrameId);
-            }
-        };
-    }, [api, isRendered]);
-
-    // 🎨 SONGSTERR-STYLE RENDERING
-    // Top overhang: White dot extends 20px above staff
-    // Bottom overhang: Cursor extends 12px below staff (like Songsterr!)
-    const TOP_OVERHANG = 20;
-    const BOTTOM_OVERHANG = 12;
-    const totalHeight = cursorPos.height + TOP_OVERHANG + BOTTOM_OVERHANG;
-
-    return (
-        <div
-            className="maestro-cursor-v211"
-            style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                pointerEvents: 'none',
-                zIndex: 99999,
-                // Apply top offset so cursor extends above staff
-                transform: `translate3d(${cursorPos.x}px, ${cursorPos.y - TOP_OVERHANG}px, 0)`,
-                width: '14px',
-                height: `${totalHeight}px`,
-                overflow: 'visible',
-                willChange: 'transform',
-
-                // 🚨 DEBUG STYLES - Remove these in production
-                border: '2px solid red',
-                backgroundColor: 'rgba(255, 0, 0, 0.2)',
-            }}
-        >
-            <svg
-                width="14"
-                height={totalHeight}
-                viewBox={`0 0 14 ${totalHeight}`}
-                preserveAspectRatio="none"
-                style={{
-                    display: 'block',
-                    overflow: 'visible',
-                    filter: 'drop-shadow(0px 2px 4px rgba(0, 0, 0, 0.5))',
-                }}
-            >
+    private renderSVG(totalHeight: number, beatHeight: number): void {
+        this.element.innerHTML = `
+            <svg width="${this.cursorWidth}" height="${totalHeight}" 
+                 viewBox="0 0 ${this.cursorWidth} ${totalHeight}"
+                 style="display:block;overflow:visible;filter:drop-shadow(0px 2px 4px rgba(0,0,0,0.5));">
                 <defs>
                     <filter id="maestroCursorShadow">
                         <feGaussianBlur in="SourceAlpha" stdDeviation="2" />
@@ -348,48 +126,61 @@ export const MaestroCursor: React.FC<MaestroCursorProps> = ({
                         </feMerge>
                     </filter>
                 </defs>
-
-                {/* Purple cursor body - extends ABOVE and BELOW staff */}
-                <path
-                    d={`M 0,7 Q 0,0 7,0 Q 14,0 14,7 
-              V ${cursorPos.height + TOP_OVERHANG} 
-              L 7 ${totalHeight} 
-              L 0 ${cursorPos.height + TOP_OVERHANG} Z`}
-                    fill="rgba(168, 85, 247, 0.45)"
-                    filter="url(#maestroCursorShadow)"
-                />
-
-                {/* White dot indicator at top */}
-                <path
-                    d="M 3.5 3 C 3.5 1.3 5 0 7 0 
-             C 9 0 10.5 1.3 10.5 3 
-             C 10.5 5.5 8 9 7 9 
-             C 6 9 3.5 5.5 3.5 3 Z"
-                    fill="white"
-                />
+                
+                <!-- Purple cursor body (bottom point lowered 2px) -->
+                <path d="M 0,7 Q 0,0 7,0 Q 14,0 14,7 
+                         V ${beatHeight + this.topOverhang} 
+                         L 7 ${totalHeight + 2}
+                         L 0 ${beatHeight + this.topOverhang} Z"
+                      fill="rgba(168, 85, 247, 0.45)"
+                      filter="url(#maestroCursorShadow)" />
+                
+                <!-- White dot (moved down 3px) -->
+                <path d="M 3.5 6 C 3.5 4.3 5 3 7 3 
+                         C 9 3 10.5 4.3 10.5 6 
+                         C 10.5 8.5 8 12 7 12 
+                         C 6 12 3.5 8.5 3.5 6 Z"
+                      fill="white" />
             </svg>
+        `;
+        console.log('✅ SVG rendered');
+    }
 
-            {/* Debug label - shows live coordinates */}
-            <div
-                style={{
-                    position: 'absolute',
-                    top: -40,
-                    left: 20,
-                    background: 'rgba(255, 0, 0, 0.9)',
-                    color: 'white',
-                    padding: '6px 10px',
-                    fontSize: '11px',
-                    borderRadius: '4px',
-                    whiteSpace: 'nowrap',
-                    pointerEvents: 'none',
-                    fontWeight: 'bold',
-                }}
-            >
-                🚨 V2.11 FINAL<br />
-                X: {cursorPos.x.toFixed(1)} | Y: {cursorPos.y.toFixed(1)} | H: {cursorPos.height}
-            </div>
-        </div>
-    );
-};
+    private updateDebugLabel(x: number, y: number, h: number, w: number): void {
+        let label = this.element.querySelector('.debug-label') as HTMLElement;
 
-export default MaestroCursor;
+        if (!label) {
+            label = document.createElement('div');
+            label.className = 'debug-label';
+            label.style.position = 'absolute';
+            label.style.top = '-40px';
+            label.style.left = '20px';
+            label.style.background = 'rgba(255, 0, 0, 0.9)';
+            label.style.color = 'white';
+            label.style.padding = '6px 10px';
+            label.style.fontSize = '11px';
+            label.style.borderRadius = '4px';
+            label.style.whiteSpace = 'nowrap';
+            label.style.fontWeight = 'bold';
+            this.element.appendChild(label);
+        }
+
+        label.innerHTML = `🎯 V3.0<br/>X: ${x.toFixed(1)} | Y: ${y.toFixed(1)} | W: ${w.toFixed(1)}`;
+    }
+
+    destroy(): void {
+        console.log('🧹 MaestroCursor v3.0: Destroying...');
+        if (this.element.parentElement) {
+            this.element.parentElement.removeChild(this.element);
+        }
+    }
+}
+
+// ========== FACTORY FUNCTION ==========
+
+export function attachMaestroCursor(api: any, container: HTMLElement): MaestroCursor {
+    const cursor = new MaestroCursor(container);
+    api.cursorHandler = cursor;
+    console.log('✅ MaestroCursor v3.0: Attached to AlphaTab API');
+    return cursor;
+}

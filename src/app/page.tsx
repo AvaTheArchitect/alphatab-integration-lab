@@ -1,16 +1,25 @@
 'use client';
 
 /**
- * AlphaTab Test Page v3.3 - PRODUCTION READY
- * Date: January 30th, 2026
+ * AlphaTab Test Page v3.5 - Hybrid Cursor WITH NATIVE RED CURSOR
+ * Date: February 7th, 2026
  * 
- * 🔥 V3.3 FINAL CONFIGURATION:
- * ✅ PlayerMode.EnabledSynthesizer (correct enum)
- * ✅ Workers enabled with CDN worker path
- * ✅ Fonts from CDN (no local files needed)
- * ✅ Soundfont local at /public/soundfont/sonivox.sf2
- * ✅ Works with Next.js public folder at repo root
- * ✅ Ready for Daniel's review
+ * 🔥 V3.5 HYBRID APPROACH + NATIVE RED CURSOR:
+ * ✅ ICursorHandler class (proper architecture)
+ * ✅ Manual updates via playedBeatChanged (alpha version workaround)
+ * ✅ Manual updates on click-to-seek
+ * ✅ Manual updates on button seek
+ * ✅ Workers ENABLED (required for synthesizer)
+ * ✅ Perfectly centered custom cursor
+ * 🔴 NATIVE RED CURSOR ENABLED (for comparison/debugging)
+ * 
+ * 📝 Why Hybrid?
+ * AlphaTab alpha version doesn't auto-call ICursorHandler.update()
+ * So we listen to events and manually trigger updates
+ * 
+ * 🔴 Native Cursor:
+ * The native AlphaTab cursor is now ENABLED and styled RED via alphaTab.css
+ * This allows side-by-side comparison with our custom MaestroCursor
  * 
  * 📂 CRITICAL: Next.js requires /public/ at project root!
  * The soundfont MUST be at: /public/soundfont/sonivox.sf2
@@ -18,10 +27,13 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
-import { MaestroCursor } from '../components/MaestroCursor';
+import { attachMaestroCursor, MaestroCursor } from '../components/MaestroCursor';
+// @ts-ignore - CSS import for red native cursor styling
+import './alphaTab.css';
 
-export default function AlphaTabTest() {
+export default function AlphaTabTestWithNativeCursor() {
     const containerRef = useRef<HTMLDivElement>(null);
+    const cursorRef = useRef<MaestroCursor | null>(null);
     const [api, setApi] = useState<any>(null);
     const [isRendered, setIsRendered] = useState(false);
     const [isPlaying, setIsPlaying] = useState(false);
@@ -47,9 +59,9 @@ export default function AlphaTabTest() {
             settings.core.fontDirectory = 'https://cdn.jsdelivr.net/npm/@coderline/alphatab@latest/dist/font/';
             settings.core.includeNoteBounds = true;
             settings.core.enableLazyLoading = false;
-            settings.core.useWorkers = false;
+            settings.core.useWorkers = true;
 
-            console.log('🔧 Workers disabled for Next.js');
+            console.log('🔧 Workers enabled for Next.js');
 
             // Display settings
             settings.display.scale = 1.0;
@@ -65,13 +77,17 @@ export default function AlphaTabTest() {
             settings.player.playerMode = alphaTab.PlayerMode.EnabledSynthesizer;
             console.log('✅ Player mode set to: EnabledSynthesizer (enum value 2)');
 
-            settings.player.enableCursor = false;
-            settings.player.enableAnimatedBeatCursor = false;
+            // 🔴 ENABLE NATIVE CURSOR (will be styled red via CSS)
+            settings.player.enableCursor = true;
+            settings.player.enableAnimatedBeatCursor = true;
+            console.log('🔴 Native cursor ENABLED (styled red via alphaTab.css)');
 
             console.log('🎵 Player config:', {
                 enablePlayer: settings.player.enablePlayer,
                 soundFont: settings.player.soundFont,
                 playerMode: (settings.player as any).playerMode,
+                enableCursor: settings.player.enableCursor,
+                enableAnimatedBeatCursor: settings.player.enableAnimatedBeatCursor,
             });
 
             if (!containerRef.current) return;
@@ -130,6 +146,19 @@ export default function AlphaTabTest() {
                             const tick = beat.absolutePlaybackStart;
                             console.log(`✅ Found beat at tick ${tick}`);
                             alphaTabApi.tickPosition = tick;
+
+                            // 🔥 CRITICAL: Manually update cursor on click
+                            if (cursorRef.current) {
+                                const beatBounds = alphaTabApi.renderer.boundsLookup.findBeat(beat);
+                                if (beatBounds?.visualBounds) {
+                                    cursorRef.current.update(beat, {
+                                        x: beatBounds.visualBounds.x,
+                                        y: beatBounds.visualBounds.y,
+                                        w: beatBounds.visualBounds.w,
+                                        h: beatBounds.visualBounds.h
+                                    });
+                                }
+                            }
                         } else {
                             console.warn('⚠️ No beat found at click position');
                         }
@@ -144,6 +173,52 @@ export default function AlphaTabTest() {
                     if (alphaTabApi.renderer?.boundsLookup?.staffSystems) {
                         console.log('✅ Bounds ready (200ms delay)');
                         setBoundsReady(true);
+
+                        // 🎯 V3.0: Attach ICursorHandler
+                        if (containerRef.current && !cursorRef.current) {
+                            cursorRef.current = attachMaestroCursor(alphaTabApi, containerRef.current);
+                            console.log('✅ MaestroCursor v3.0 attached!');
+
+                            // 🔍 DIAGNOSTIC: Test if update method works
+                            setTimeout(() => {
+                                if (cursorRef.current) {
+                                    console.log('🔍 Testing cursor update manually...');
+
+                                    // Try to manually trigger an update
+                                    const trackIndices = alphaTabApi.tracks
+                                        ? new Set(alphaTabApi.tracks.map((t: any) => t.index))
+                                        : new Set([0]);
+
+                                    const tickCache = (alphaTabApi as any).tickCache;
+                                    if (tickCache) {
+                                        const beatResult = tickCache.findBeat(trackIndices, 0);
+                                        if (beatResult?.beat && alphaTabApi.renderer?.boundsLookup) {
+                                            const beatBounds = alphaTabApi.renderer.boundsLookup.findBeat(beatResult.beat);
+                                            if (beatBounds?.visualBounds) {
+                                                console.log('🔍 Manually calling update with:', {
+                                                    tick: beatResult.beat.absolutePlaybackStart,
+                                                    x: beatBounds.visualBounds.x,
+                                                    y: beatBounds.visualBounds.y,
+                                                    w: beatBounds.visualBounds.w,
+                                                    h: beatBounds.visualBounds.h
+                                                });
+
+                                                // Manual update call
+                                                cursorRef.current.update(beatResult.beat, {
+                                                    x: beatBounds.visualBounds.x,
+                                                    y: beatBounds.visualBounds.y,
+                                                    w: beatBounds.visualBounds.w,
+                                                    h: beatBounds.visualBounds.h
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }, 500);
+
+                            // 🔴 DO NOT hide native cursor - we want to see it in red!
+                            console.log('🔴 Native red cursor kept visible for comparison');
+                        }
 
                         const lookup = alphaTabApi.renderer.boundsLookup;
                         console.log('📊 Bounds Info:', {
@@ -204,8 +279,22 @@ export default function AlphaTabTest() {
                 setIsPlaying(!e.stopped);
             });
 
+            // 🎵 Beat changed - MANUALLY update cursor!
             alphaTabApi.playedBeatChanged.on((beat: any) => {
                 console.log('🎵 Beat changed:', beat.absolutePlaybackStart);
+
+                // 🔥 CRITICAL: Manually trigger cursor update
+                if (cursorRef.current && alphaTabApi.renderer?.boundsLookup) {
+                    const beatBounds = alphaTabApi.renderer.boundsLookup.findBeat(beat);
+                    if (beatBounds?.visualBounds) {
+                        cursorRef.current.update(beat, {
+                            x: beatBounds.visualBounds.x,
+                            y: beatBounds.visualBounds.y,
+                            w: beatBounds.visualBounds.w,
+                            h: beatBounds.visualBounds.h
+                        });
+                    }
+                }
             });
 
             setApi(alphaTabApi);
@@ -273,6 +362,13 @@ export default function AlphaTabTest() {
 
         return () => {
             destroyed = true;
+
+            // Destroy cursor
+            if (cursorRef.current) {
+                cursorRef.current.destroy();
+                cursorRef.current = null;
+            }
+
             if (api) {
                 api.destroy();
             }
@@ -312,6 +408,29 @@ export default function AlphaTabTest() {
         const targetTick = 10000;
         console.log(`🎯 Seek to tick ${targetTick}`);
         api.tickPosition = targetTick;
+
+        // 🔥 CRITICAL: Manually update cursor on seek
+        if (cursorRef.current) {
+            const trackIndices = api.tracks
+                ? new Set(api.tracks.map((t: any) => t.index))
+                : new Set([0]);
+
+            const tickCache = (api as any).tickCache;
+            if (tickCache) {
+                const beatResult = tickCache.findBeat(trackIndices, targetTick);
+                if (beatResult?.beat && api.renderer?.boundsLookup) {
+                    const beatBounds = api.renderer.boundsLookup.findBeat(beatResult.beat);
+                    if (beatBounds?.visualBounds) {
+                        cursorRef.current.update(beatResult.beat, {
+                            x: beatBounds.visualBounds.x,
+                            y: beatBounds.visualBounds.y,
+                            w: beatBounds.visualBounds.w,
+                            h: beatBounds.visualBounds.h
+                        });
+                    }
+                }
+            }
+        }
     };
 
     const handleTogglePlay = () => {
@@ -348,7 +467,7 @@ export default function AlphaTabTest() {
                 borderRadius: '8px',
                 maxWidth: '300px',
             }}>
-                <h3 style={{ margin: '0 0 10px 0', fontSize: '14px' }}>Debug v3.3 - READY</h3>
+                <h3 style={{ margin: '0 0 10px 0', fontSize: '14px' }}>🔴 v3.5 - Hybrid + Red Native</h3>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                     <button
                         onClick={handleSeek}
@@ -420,13 +539,31 @@ export default function AlphaTabTest() {
                 marginBottom: '20px',
                 borderRadius: '8px',
             }}>
-                <h2 style={{ margin: '0 0 10px 0' }}>🔥 v3.3 - PRODUCTION READY</h2>
+                <h2 style={{ margin: '0 0 10px 0' }}>🔴 v3.5 - Hybrid Cursor + Native Red Cursor</h2>
                 <ul style={{ margin: 0 }}>
-                    <li>✅ PlayerMode.EnabledSynthesizer (enum value 2)</li>
-                    <li>✅ Workers enabled with CDN path</li>
-                    <li>✅ Root-relative paths for Next.js</li>
-                    <li>✅ Ready for Daniel's review</li>
+                    <li>✅ ICursorHandler + Manual Updates</li>
+                    <li>✅ Moves during playback (playedBeatChanged)</li>
+                    <li>✅ Updates on click-to-seek</li>
+                    <li>✅ Updates on button seek</li>
+                    <li>✅ Perfectly centered custom cursor</li>
+                    <li>🔴 <strong>Native AlphaTab cursor ENABLED in RED</strong></li>
+                    <li>🔍 Compare custom vs. native cursor behavior</li>
                 </ul>
+                <div style={{
+                    marginTop: '10px',
+                    padding: '8px',
+                    background: '#ffebee',
+                    borderRadius: '4px',
+                    fontSize: '12px',
+                }}>
+                    <strong>🔴 What to Look For:</strong>
+                    <ul style={{ margin: '5px 0', paddingLeft: '20px' }}>
+                        <li><strong>Red cursor</strong> = Native AlphaTab cursor</li>
+                        <li><strong>Custom cursor</strong> = Your MaestroCursor</li>
+                        <li>Watch for drift/sync differences during playback</li>
+                        <li>Compare positioning on click-to-seek</li>
+                    </ul>
+                </div>
                 <div style={{
                     marginTop: '10px',
                     padding: '8px',
@@ -441,7 +578,10 @@ export default function AlphaTabTest() {
 │   └── /soundfont
 │       └── sonivox.sf2  ⬅️ Required!
 └── /src
-    ├── /app/page.tsx
+    ├── /app
+    │   ├── page.tsx (original)
+    │   ├── alphaTab.css ⬅️ Red cursor styles
+    │   └── [new-page].tsx (this file)
     └── /components/
         └── MaestroCursor.tsx
 
@@ -461,14 +601,9 @@ Note: Fonts loaded from CDN automatically
                     overflow: 'visible',
                 }}
             >
-                {isRendered && boundsReady && api && (
-                    <MaestroCursor
-                        api={api}
-                        isRendered={true}
-                        isPlaying={isPlaying}
-                        renderCycle={renderCycle}
-                    />
-                )}
+                {/* Both cursors will be visible: 
+                    - Red native cursor (via AlphaTab settings + CSS)
+                    - Custom MaestroCursor (via ICursorHandler) */}
             </div>
         </div>
     );

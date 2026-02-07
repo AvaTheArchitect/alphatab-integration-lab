@@ -1,0 +1,42 @@
+/* 🧪 ALPHATAB LABS: RED DEBUG CURSOR STYLES */
+
+/* Main surface behavior */
+.at-surface {
+    width: 100%;
+    position: relative;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+
+/* 🔴 FORCE NATIVE CURSOR TO THICK SOLID RED 
+   We keep the native cursor visible so Daniel can see the drift.
+*/
+.at-cursor-beat {
+    background: rgb(255, 0, 0) !important; /* Solid Red - no transparency */
+    border: 5px solid rgb(200, 0, 0) !important; /* Darker red border for contrast */
+    width: 350px !important; /* Thicker line */
+    min-width: 350px !important; /* Force minimum width */
+    z-index: 998 !important;
+      display: block !important; /* Ensure it stays visible */
+    opacity: 1 !important; /* Force full opacity */
+}
+
+/* Hide the bar cursor to keep the view clean */
+.at-cursor-bar {
+    display: none !important;
+}
+
+/* Standard AlphaTab font loading (Required for symbols) */
+@font-face {
+    font-family: 'alphaTab';
+    src: url('https://cdn.jsdelivr.net/npm/@coderline/alphatab@latest/dist/font/Bravura.woff2') format('woff2');
+}
+
+.at {
+    font-family: 'alphaTab', sans-serif;
+}
+
+/* Ensure our Maestro Cursor stays on top of the Red one */
+.maestro-cursor {
+    z-index: 1000 !important;
+}
