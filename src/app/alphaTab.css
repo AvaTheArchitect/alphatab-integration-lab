@@ -8,6 +8,17 @@
     overflow-x: hidden;
 }
 
+/* 🔥 Prevent browser text selection inside AlphaTab */
+.at-surface,
+.at-viewport,
+.at,
+.at svg,
+.at text {
+    user-select: none;
+    -webkit-user-select: none;
+    -moz-user-select: none;
+}
+
 /* 🔴 FORCE NATIVE CURSOR TO THICK SOLID RED 
    We keep the native cursor visible so Daniel can see the drift.
 */
@@ -17,7 +28,7 @@
     width: 350px !important; /* Thicker line */
     min-width: 350px !important; /* Force minimum width */
     z-index: 998 !important;
-      display: block !important; /* Ensure it stays visible */
+    display: block !important; /* Ensure it stays visible */
     opacity: 1 !important; /* Force full opacity */
 }
 

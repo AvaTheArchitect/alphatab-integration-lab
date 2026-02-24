@@ -1,609 +1,627 @@
 'use client';
 
 /**
- * AlphaTab Test Page v3.5 - Hybrid Cursor WITH NATIVE RED CURSOR
- * Date: February 7th, 2026
- * 
- * 🔥 V3.5 HYBRID APPROACH + NATIVE RED CURSOR:
- * ✅ ICursorHandler class (proper architecture)
- * ✅ Manual updates via playedBeatChanged (alpha version workaround)
- * ✅ Manual updates on click-to-seek
- * ✅ Manual updates on button seek
- * ✅ Workers ENABLED (required for synthesizer)
- * ✅ Perfectly centered custom cursor
- * 🔴 NATIVE RED CURSOR ENABLED (for comparison/debugging)
- * 
- * 📝 Why Hybrid?
- * AlphaTab alpha version doesn't auto-call ICursorHandler.update()
- * So we listen to events and manually trigger updates
- * 
- * 🔴 Native Cursor:
- * The native AlphaTab cursor is now ENABLED and styled RED via alphaTab.css
- * This allows side-by-side comparison with our custom MaestroCursor
- * 
- * 📂 CRITICAL: Next.js requires /public/ at project root!
- * The soundfont MUST be at: /public/soundfont/sonivox.sf2
- * Fonts load automatically from CDN
+ * AlphaTab Labs Page v5.30 — Stable Repeat + Loop Cursor Engine
+ * Date: February 22nd, 2026
+ *
+ * 🔒 Engine Architecture Locked
+ * - Expanded beat resolution via masterBars traversal (occurrence-aware)
+ * - isSameBeat() O(1) gate — both scans run once per beat entry only
+ * - Backward + forward scans frozen in stable refs for beat duration
+ * - Loop safety margin prevents dead-zone exposure in audio worker
+ * - Jump detection guards whammy re-sync / repeat / seek discontinuities
+ *
+ * See /docs/maestro-cursor-postmortem.md for full version history.
  */
 
 import React, { useEffect, useRef, useState } from 'react';
 import { attachMaestroCursor, MaestroCursor } from '../components/MaestroCursor';
-// @ts-ignore - CSS import for red native cursor styling
+import BeatCustomLoopOverlay from '../components/BeatCustomLoopOverlay';
+
 import './alphaTab.css';
 
-export default function AlphaTabTestWithNativeCursor() {
+const DEBUG = false;
+
+export default function AlphaTabLabsPage() {
     const containerRef = useRef<HTMLDivElement>(null);
+    const surfaceRef = useRef<HTMLElement | null>(null);
     const cursorRef = useRef<MaestroCursor | null>(null);
-    const [api, setApi] = useState<any>(null);
+    const apiRef = useRef<any>(null);
+    const loopEnabledRef = useRef(false);               // 🔒 ref — closure in playerPositionChanged
+
+    // 🔒 Stable per-beat refs — all written once on beat entry, read every frame
+    const lastTickRef = useRef<number | null>(null);           // transport jump detection
+    const stableCurBeatRef = useRef<any>(null);                // beat identity — O(1) isSameBeat gate
+    const stableExpandedBeatStartRef = useRef<number>(0);      // frozen beat start tick
+    const stableNextBeatRef = useRef<any>(null);               // frozen next beat (null = Mode B)
+
     const [isRendered, setIsRendered] = useState(false);
     const [isPlaying, setIsPlaying] = useState(false);
     const [forceReady, setForceReady] = useState(false);
-    const [renderCycle, setRenderCycle] = useState(0);
     const [boundsReady, setBoundsReady] = useState(false);
+    const [surfaceReady, setSurfaceReady] = useState(false);
     const [soundfontStatus, setSoundfontStatus] = useState<'loading' | 'loaded' | 'error'>('loading');
+    const [persistedLoop, setPersistedLoop] = useState<{ startTick: number; endTick: number } | null>(null);
+    const [loopEnabled, setLoopEnabled] = useState(false);
+    const [boundsEpoch, setBoundsEpoch] = useState(0);
 
+    const manualLoopDisposerRef = useRef<any>(null);
+
+    // ─────────────────────────────────────────
+    // Cursor Helpers
+    // ─────────────────────────────────────────
+
+    // findBeat() is visual-first — returns pass-1 (structural) beat only.
+    // Only used for immediate snap (initial render, manual seek).
+    // Never used for walking resolution — playerPositionChanged owns that.
+    function updateCursorForTick(api: any, tick: number) {
+        if (!cursorRef.current || !api.renderer?.boundsLookup) return;
+        const trackIndices = api.tracks
+            ? new Set(api.tracks.map((t: any) => t.index))
+            : new Set([0]);
+        const tickCache = (api as any).tickCache;
+        if (!tickCache) return;
+        const beatResult = tickCache.findBeat(trackIndices, tick);
+        if (beatResult?.beat) {
+            cursorRef.current.setBeat(beatResult.beat);
+            cursorRef.current.setTick(tick);
+        }
+    }
+
+    // ─────────────────────────────────────────
+    // Manual Loop Control
+    // ─────────────────────────────────────────
+
+    function enableManualLoop(api: any) {
+        if (!api?.playbackRange) return;
+        const start = api.playbackRange.startTick;
+        const endExclusive = api.playbackRange.endTick;
+
+        // 🔒 MANUAL LOOP — DETERMINISTIC LAST-BEAT WRAP
+        //
+        // Why manual over native (api.isLooping = true):
+        //   Native loop causes an audio/cursor hiccup at M4–M5 boundary because
+        //   AlphaTab's internal scheduler can stall or emit a tick >= endExclusive
+        //   before wrapping, causing a 1-frame cursor poisoning and audible pause.
+        //
+        // lastValid is computed from the actual last resolvable beat inside the range —
+        // deterministic, tempo-independent, always correct. Never use a magic offset.
+        const trackIndices = api.tracks
+            ? new Set(api.tracks.map((t: any) => t.index))
+            : new Set([0]);
+
+        let lastValid = start;
+        for (let t = endExclusive - 1; t >= start; t--) {
+            const r = api.tickCache?.findBeat(trackIndices, t);
+            if (r?.beat) { lastValid = t; break; }
+        }
+
+        api.isLooping = false; // disable native — this handler is single source of truth
+
+        manualLoopDisposerRef.current = api.playerPositionChanged.on((e: any) => {
+            const tick = e.currentTick ?? e.tickPosition;
+            if (tick == null) return;
+            if (tick < start) { api.tickPosition = start; return; }
+            if (tick >= lastValid) { api.tickPosition = start; }
+        });
+
+        console.log(`🎼 Manual Loop Enabled: ${start}–${endExclusive}, lastValid=${lastValid}`);
+    }
+
+    function disableManualLoop() {
+        if (manualLoopDisposerRef.current) {
+            manualLoopDisposerRef.current();
+            manualLoopDisposerRef.current = null;
+            console.log('🎼 Manual Loop Disabled');
+        }
+    }
+
+    // ─────────────────────────────────────────
     // Initialize AlphaTab
+    // ─────────────────────────────────────────
+
     useEffect(() => {
-        if (!containerRef.current || api) return;
+        if (!containerRef.current || apiRef.current) return;
 
         let destroyed = false;
 
-        const initAlphaTab = async () => {
+        const init = async () => {
             const alphaTab = await import('@coderline/alphatab');
+            if (destroyed || !containerRef.current) return;
 
             const settings = new alphaTab.Settings();
-
-            // Core settings
             settings.core.engine = 'svg';
             settings.core.logLevel = alphaTab.LogLevel.Debug;
-            settings.core.fontDirectory = 'https://cdn.jsdelivr.net/npm/@coderline/alphatab@latest/dist/font/';
+            settings.core.fontDirectory =
+                'https://cdn.jsdelivr.net/npm/@coderline/alphatab@latest/dist/font/';
             settings.core.includeNoteBounds = true;
             settings.core.enableLazyLoading = false;
             settings.core.useWorkers = true;
-
-            console.log('🔧 Workers enabled for Next.js');
-
-            // Display settings
             settings.display.scale = 1.0;
             settings.display.layoutMode = alphaTab.LayoutMode.Page;
             settings.display.staveProfile = alphaTab.StaveProfile.Tab;
-
-            // 🔥 FIX: Player settings with ENUM!
             settings.player.enablePlayer = true;
             settings.player.soundFont = '/soundfont/sonivox.sf2';
             settings.player.scrollMode = alphaTab.ScrollMode.Off;
-
-            // 🔥 CRITICAL: Use correct enum value (matches AlphaTabRenderer)
             settings.player.playerMode = alphaTab.PlayerMode.EnabledSynthesizer;
-            console.log('✅ Player mode set to: EnabledSynthesizer (enum value 2)');
-
-            // 🔴 ENABLE NATIVE CURSOR (will be styled red via CSS)
+            settings.player.enableUserInteraction = false;
             settings.player.enableCursor = true;
             settings.player.enableAnimatedBeatCursor = true;
-            console.log('🔴 Native cursor ENABLED (styled red via alphaTab.css)');
 
-            console.log('🎵 Player config:', {
-                enablePlayer: settings.player.enablePlayer,
-                soundFont: settings.player.soundFont,
-                playerMode: (settings.player as any).playerMode,
-                enableCursor: settings.player.enableCursor,
-                enableAnimatedBeatCursor: settings.player.enableAnimatedBeatCursor,
-            });
+            if (DEBUG) console.log('🔧 AlphaTab Labs v5.30 initializing...');
 
-            if (!containerRef.current) return;
+            const api = new alphaTab.AlphaTabApi(containerRef.current, settings);
+            if (destroyed) { api.destroy(); return; }
 
-            const alphaTabApi = new alphaTab.AlphaTabApi(containerRef.current, settings);
+            apiRef.current = api;
+            (window as any).__at = api;
 
-            if (destroyed) {
-                alphaTabApi.destroy();
-                return;
-            }
-
-            // Load test file
             const response = await fetch('/samples/extreme-rise/extreme-rise.gp5');
             const arrayBuffer = await response.arrayBuffer();
-            alphaTabApi.load(new Uint8Array(arrayBuffer));
+            api.load(new Uint8Array(arrayBuffer));
 
-            // Event handlers
-            alphaTabApi.scoreLoaded.on(() => {
-                console.log('✅ Score loaded');
-            });
+            setTimeout(() => {
+                if (!containerRef.current) return;
+                const surface = containerRef.current.querySelector('.at-surface') as HTMLElement;
+                if (surface) {
+                    surfaceRef.current = surface;
+                    setSurfaceReady(true);
+                    if (DEBUG) console.log('✅ Surface reference captured for overlay');
+                }
+            }, 200);
 
-            alphaTabApi.renderStarted.on(() => {
-                console.log('🎨 Render started');
-                setBoundsReady(false);
-                setRenderCycle(c => c + 1);
-            });
+            api.scoreLoaded.on(() => { if (DEBUG) console.log('✅ Score loaded'); });
+            api.renderStarted.on(() => { setBoundsReady(false); });
 
-            alphaTabApi.renderFinished.on(() => {
-                console.log('✅ Render finished');
+            api.renderFinished.on(() => {
                 setIsRendered(true);
-
-                // Click-to-seek handler
                 setTimeout(() => {
-                    if (!containerRef.current) return;
-
-                    const surface = containerRef.current.querySelector('.at-surface') as HTMLElement;
-                    const target = surface || containerRef.current;
-
-                    console.log('✅ Attaching click handler');
-
-                    const handleClick = (e: MouseEvent) => {
-                        if (!alphaTabApi.renderer?.boundsLookup) {
-                            console.warn('⚠️ boundsLookup not available');
-                            return;
-                        }
-
-                        const rect = containerRef.current!.getBoundingClientRect();
-                        const x = e.clientX - rect.left + containerRef.current!.scrollLeft;
-                        const y = e.clientY - rect.top + containerRef.current!.scrollTop;
-
-                        console.log(`🖱️ Click at X=${x.toFixed(1)}, Y=${y.toFixed(1)}`);
-
-                        const beat = alphaTabApi.renderer.boundsLookup.getBeatAtPos(x, y);
-
-                        if (beat && beat.absolutePlaybackStart !== undefined) {
-                            const tick = beat.absolutePlaybackStart;
-                            console.log(`✅ Found beat at tick ${tick}`);
-                            alphaTabApi.tickPosition = tick;
-
-                            // 🔥 CRITICAL: Manually update cursor on click
-                            if (cursorRef.current) {
-                                const beatBounds = alphaTabApi.renderer.boundsLookup.findBeat(beat);
-                                if (beatBounds?.visualBounds) {
-                                    cursorRef.current.update(beat, {
-                                        x: beatBounds.visualBounds.x,
-                                        y: beatBounds.visualBounds.y,
-                                        w: beatBounds.visualBounds.w,
-                                        h: beatBounds.visualBounds.h
-                                    });
-                                }
-                            }
-                        } else {
-                            console.warn('⚠️ No beat found at click position');
-                        }
-                    };
-
-                    target.addEventListener('click', handleClick);
-                    console.log('✅ Click-to-seek enabled');
-                }, 100);
-
-                // Wait for bounds to populate
-                setTimeout(() => {
-                    if (alphaTabApi.renderer?.boundsLookup?.staffSystems) {
-                        console.log('✅ Bounds ready (200ms delay)');
-                        setBoundsReady(true);
-
-                        // 🎯 V3.0: Attach ICursorHandler
-                        if (containerRef.current && !cursorRef.current) {
-                            cursorRef.current = attachMaestroCursor(alphaTabApi, containerRef.current);
-                            console.log('✅ MaestroCursor v3.0 attached!');
-
-                            // 🔍 DIAGNOSTIC: Test if update method works
-                            setTimeout(() => {
-                                if (cursorRef.current) {
-                                    console.log('🔍 Testing cursor update manually...');
-
-                                    // Try to manually trigger an update
-                                    const trackIndices = alphaTabApi.tracks
-                                        ? new Set(alphaTabApi.tracks.map((t: any) => t.index))
-                                        : new Set([0]);
-
-                                    const tickCache = (alphaTabApi as any).tickCache;
-                                    if (tickCache) {
-                                        const beatResult = tickCache.findBeat(trackIndices, 0);
-                                        if (beatResult?.beat && alphaTabApi.renderer?.boundsLookup) {
-                                            const beatBounds = alphaTabApi.renderer.boundsLookup.findBeat(beatResult.beat);
-                                            if (beatBounds?.visualBounds) {
-                                                console.log('🔍 Manually calling update with:', {
-                                                    tick: beatResult.beat.absolutePlaybackStart,
-                                                    x: beatBounds.visualBounds.x,
-                                                    y: beatBounds.visualBounds.y,
-                                                    w: beatBounds.visualBounds.w,
-                                                    h: beatBounds.visualBounds.h
-                                                });
-
-                                                // Manual update call
-                                                cursorRef.current.update(beatResult.beat, {
-                                                    x: beatBounds.visualBounds.x,
-                                                    y: beatBounds.visualBounds.y,
-                                                    w: beatBounds.visualBounds.w,
-                                                    h: beatBounds.visualBounds.h
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }, 500);
-
-                            // 🔴 DO NOT hide native cursor - we want to see it in red!
-                            console.log('🔴 Native red cursor kept visible for comparison');
-                        }
-
-                        const lookup = alphaTabApi.renderer.boundsLookup;
-                        console.log('📊 Bounds Info:', {
-                            staffSystems: lookup.staffSystems?.length || 0,
-                        });
-
-                        if (lookup.staffSystems?.[0]) {
-                            const system = lookup.staffSystems[0];
-                            console.log('📐 First System:', {
-                                y: system.realBounds?.y,
-                                h: system.realBounds?.h,
-                            });
-                        }
-
-                        const trackIndices = alphaTabApi.tracks
-                            ? new Set(alphaTabApi.tracks.map((t: any) => t.index))
-                            : new Set([0]);
-
-                        const tickCache = (alphaTabApi as any).tickCache;
-                        if (tickCache) {
-                            const beatResult = tickCache.findBeat(trackIndices, 0);
-                            if (beatResult?.beat) {
-                                const beatBounds = lookup.findBeat(beatResult.beat);
-                                if (beatBounds) {
-                                    console.log('🎯 First Beat Bounds (NESTED):', {
-                                        'visualBounds is object': typeof beatBounds.visualBounds === 'object',
-                                        'visualBounds.x': beatBounds.visualBounds?.x,
-                                        'visualBounds.y': beatBounds.visualBounds?.y,
-                                        'visualBounds.h': beatBounds.visualBounds?.h,
-                                    });
-                                }
-                            }
-                        }
-                    } else {
+                    if (!api.renderer?.boundsLookup?.staffSystems) {
                         console.warn('⚠️ Bounds not ready after delay');
+                        return;
+                    }
+                    setBoundsReady(true);
+                    setBoundsEpoch(e => e + 1);
+
+                    if (containerRef.current && !cursorRef.current) {
+                        cursorRef.current = attachMaestroCursor(api, containerRef.current);
+                        if (DEBUG) console.log('✅ MaestroCursor attached');
+                        setTimeout(() => updateCursorForTick(api, 0), 300);
+                    } else if (cursorRef.current) {
+                        const currentTick = api.tickPosition ?? 0;
+                        setTimeout(() => updateCursorForTick(api, currentTick), 100);
+                        if (DEBUG) console.log('🔄 Cursor position refreshed after bounds update');
+                    }
+
+                    if (DEBUG) {
+                        const systems = api.renderer.boundsLookup.staffSystems || [];
+                        console.log(`📊 Bounds ready: ${systems.length} staff systems`);
                     }
                 }, 200);
             });
 
-            // 🎵 Soundfont loading events
-            if (alphaTabApi.soundFontLoad) {
-                alphaTabApi.soundFontLoad.on(() => {
-                    console.log('🎵 Soundfont loading started...');
-                    setSoundfontStatus('loading');
-                });
-            }
-
-            if (alphaTabApi.soundFontLoaded) {
-                alphaTabApi.soundFontLoaded.on(() => {
-                    console.log('✅ Soundfont loaded successfully!');
-                    setSoundfontStatus('loaded');
-                });
-            }
-
-            // 🎵 Monitor player state changes
-            alphaTabApi.playerStateChanged.on((e: any) => {
-                console.log('🎵 Player state:', e.state, 'stopped:', e.stopped);
-                setIsPlaying(!e.stopped);
+            api.soundFontLoad?.on(() => setSoundfontStatus('loading'));
+            api.soundFontLoaded?.on(() => {
+                if (DEBUG) console.log('✅ Soundfont loaded');
+                setSoundfontStatus('loaded');
             });
 
-            // 🎵 Beat changed - MANUALLY update cursor!
-            alphaTabApi.playedBeatChanged.on((beat: any) => {
-                console.log('🎵 Beat changed:', beat.absolutePlaybackStart);
+            let stateChangeTimeout: NodeJS.Timeout;
+            let lastManualToggle = 0;
 
-                // 🔥 CRITICAL: Manually trigger cursor update
-                if (cursorRef.current && alphaTabApi.renderer?.boundsLookup) {
-                    const beatBounds = alphaTabApi.renderer.boundsLookup.findBeat(beat);
-                    if (beatBounds?.visualBounds) {
-                        cursorRef.current.update(beat, {
-                            x: beatBounds.visualBounds.x,
-                            y: beatBounds.visualBounds.y,
-                            w: beatBounds.visualBounds.w,
-                            h: beatBounds.visualBounds.h
-                        });
+            api.playerStateChanged.on((e: any) => {
+                clearTimeout(stateChangeTimeout);
+                stateChangeTimeout = setTimeout(() => {
+                    if (Date.now() - lastManualToggle < 100) {
+                        if (DEBUG) console.log('🎵 playerStateChanged: ignored (too close to manual toggle)');
+                        const snapTick = api.tickPosition ?? lastTickRef.current;
+                        if (snapTick != null) {
+                            requestAnimationFrame(() => updateCursorForTick(api, snapTick));
+                        }
+                        return;
+                    }
+                    const newState = !e.stopped;
+                    console.log(`🎵 playerStateChanged: stopped=${e.stopped}, newState=${newState}`);
+                    setIsPlaying(newState);
+                }, 50);
+            });
+
+            (api as any)._lastManualToggle = () => { lastManualToggle = Date.now(); };
+
+            /**
+             * 🔒🔒🔒 CURSOR ENGINE LOCK — DO NOT MODIFY THIS BLOCK 🔒🔒🔒
+             *
+             * Proven stable as of v5.30. Drives Maestro v4.3.8 smooth walking cursor.
+             *
+             * Contract:
+             *   - masterBars occurrence traversal → correct expanded beat (not structural pass-1)
+             *   - isSameBeat() O(1) gate → both scans fire ONCE per beat entry
+             *   - Backward scan → expandedBeatStart (frozen in stableExpandedBeatStartRef)
+             *   - Forward scan → nextBeat (frozen in stableNextBeatRef)
+             *   - 3-arg cursor contract: setBeat() + setTick(tick, nextBeat, expandedBeatStart)
+             *
+             * DO NOT:
+             *   - Move either scan outside the isSameBeat gate (reintroduces 720k calls/beat)
+             *   - Use beat.nextBeat or beat.absolutePlaybackStart as authoritative values
+             *   - Simplify to cursor.setTick(tick) one-arg — drops repeat-aware walk
+             *   - Pass expandedBeatStart as FIRST arg to setTick() — zeros progress every frame
+             *   - Add interpolation math here — MaestroCursor owns all walking state
+             *   - Remove the isSameBeat() structural check — post-repeat instances differ
+             *   - Remove loopEnabledRef clamp — state is stale inside this closure
+             */
+            api.playerPositionChanged.on((e: any) => {
+                if (!cursorRef.current) return;
+
+                const tickRaw = e.currentTick ?? e.tickPosition;
+                if (tickRaw == null) return;
+
+                // 🔒 LOOP BOUNDARY ENFORCER — DO NOT REMOVE
+                // Intercepts ticks before endTick to prevent audio worker dead-zone exposure.
+                // SAFETY_MARGIN = 120 ticks (~1/16 note at 480 PPQ).
+                // This is NOT a cosmetic clamp — it prevents transport dead-zone stall.
+                const range = api.playbackRange;
+                if (loopEnabledRef.current && range) {
+                    const { startTick, endTick } = range;
+                    const SAFETY_MARGIN = 120;
+                    if (tickRaw >= endTick - SAFETY_MARGIN) {
+                        cursorRef.current?.requestSnap();
+                        api.tickPosition = startTick;
+                        return;
                     }
                 }
+
+                const tick = tickRaw;
+
+                // 🔒 JUMP DETECTION — guards whammy re-sync, repeat wrap, seek discontinuities.
+                // Threshold: 2000 ticks (~2 beats at 480 PPQ).
+                const lastTick = lastTickRef.current;
+                const jumped = lastTick != null && Math.abs(tick - lastTick) > 2000;
+                lastTickRef.current = tick;
+                if (jumped) {
+                    cursorRef.current?.requestSnap();
+                    stableCurBeatRef.current = null;
+                    stableExpandedBeatStartRef.current = 0;
+                }
+
+                const trackIndices = api.tracks
+                    ? new Set(api.tracks.map((t: any) => t.index))
+                    : new Set([0]);
+
+                const tickCache = (api as any).tickCache;
+                if (!tickCache) return;
+
+                // ── Expanded Beat Resolution ─────────────────────────────────────────
+                // findBeat() is structurally biased — always returns pass-1 beat instance.
+                // masterBars traversal gives the correct occurrence for the current pass.
+                //
+                // Algorithm:
+                //   1. Walk masterBars → find entry [start, start+dur) owning tick
+                //      → gives ownerOccurrence + ownerExpandedStart
+                //   2. Walk boundsLookup.staffSystems → find Nth visual instance of masterBar
+                //   3. Walk BarBounds → VoiceBounds → BeatBounds → match by expanded offset
+                //   4. Fallback: findBeat() if masterBars unavailable or traversal fails
+                let curBeat: any = null;
+
+                const masterBarsArr = (tickCache as any).masterBars as any[];
+                if (masterBarsArr?.length) {
+                    const occurrenceMap = new Map<number, number>();
+                    let ownerMbIdx: number | null = null;
+                    let ownerOccurrence = 0;
+                    let ownerExpandedStart = 0;
+
+                    for (const mb of masterBarsArr) {
+                        const mbIdx = mb?.masterBar?.index;
+                        if (mbIdx == null) continue;
+                        const occ = occurrenceMap.get(mbIdx) ?? 0;
+                        occurrenceMap.set(mbIdx, occ + 1);
+                        const dur = mb.masterBar?.calculateDuration?.() ?? 0;
+                        if (tick >= mb.start && tick < mb.start + dur) {
+                            ownerMbIdx = mbIdx;
+                            ownerOccurrence = occ;
+                            ownerExpandedStart = mb.start;
+                        }
+                    }
+
+                    if (ownerMbIdx != null) {
+                        const systems = api.renderer?.boundsLookup?.staffSystems ?? [];
+                        const visualOccMap = new Map<number, number>();
+                        let targetMbb: any = null;
+
+                        outer2: for (const sys of systems) {
+                            for (const mbb of ((sys as any)?.bars ?? [])) {
+                                const vbIdx = (mbb as any)?.masterBar?.index ?? (mbb as any)?.index;
+                                if (vbIdx == null) continue;
+                                const vOcc = visualOccMap.get(vbIdx) ?? 0;
+                                visualOccMap.set(vbIdx, vOcc + 1);
+                                if (vbIdx === ownerMbIdx && vOcc === ownerOccurrence) {
+                                    targetMbb = mbb;
+                                    break outer2;
+                                }
+                            }
+                        }
+
+                        // 🔒 NO track filter here — matched correct masterBar occurrence in Step 2.
+                        // Track filtering at MasterBar level is sufficient; adding it here causes
+                        // silent fallthrough in solo/whammy bars where staff path differs.
+                        if (targetMbb) {
+                            outer3: for (const barBounds of ((targetMbb as any)?.bars ?? [])) {
+                                for (const voiceBounds of ((barBounds as any)?.voices ?? [])) {
+                                    for (const beatBounds of ((voiceBounds as any)?.beats ?? [])) {
+                                        const beat = (beatBounds as any)?.beat;
+                                        if (!beat) continue;
+                                        const bOffset = beat.playbackStart ?? 0;
+                                        const bDur = beat.playbackDuration ?? beat.duration ?? 0;
+                                        const beatExpandedStart = ownerExpandedStart + bOffset;
+                                        if (beatExpandedStart <= tick && tick < beatExpandedStart + bDur) {
+                                            curBeat = beat;
+                                            break outer3;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: findBeat() — structurally biased, but better than null
+                if (!curBeat) {
+                    const beatResult = tickCache.findBeat(trackIndices, tick);
+                    if (!beatResult?.beat) return;
+                    curBeat = beatResult.beat;
+                }
+
+                // Structural equality — post-repeat, tickCache returns different Beat instances
+                // for the same structural beat. Reference equality is insufficient.
+                const isSameBeat = (a: any, b: any) => {
+                    if (!a || !b) return false;
+                    return (
+                        a.absolutePlaybackStart === b.absolutePlaybackStart &&
+                        a.voice?.bar?.masterBar?.index === b.voice?.bar?.masterBar?.index
+                    );
+                };
+
+                // 🔒 BEAT ENTRY GUARD — isSameBeat() is O(1), gates both expensive scans.
+                // Both scans run exactly once on beat entry; per-frame cost is O(1).
+                //
+                // Root cause of v5.27 solo freeze: both scans ran every frame.
+                // Beat 380160 (3840 ticks, ~4s): 120 frames × 6000 findBeat = 720,000 calls
+                // → main thread stall → audio catches up → cursor teleport.
+                if (!isSameBeat(curBeat, stableCurBeatRef.current) || jumped) {
+                    stableCurBeatRef.current = curBeat;
+
+                    // Backward scan: find expandedBeatStart.
+                    // 🔒 ONCE per beat — O(2000) on entry only, fatal if run per-frame.
+                    let expandedBeatStart = tick;
+                    for (let t = tick - 1; t >= tick - 2000; t--) {
+                        const r = tickCache.findBeat(trackIndices, t);
+                        if (!r?.beat || !isSameBeat(r.beat, curBeat)) {
+                            expandedBeatStart = t + 1;
+                            break;
+                        }
+                    }
+                    stableExpandedBeatStartRef.current = expandedBeatStart;
+
+                    // Forward scan: find nextBeat.
+                    // 🔒 ONCE per beat — same reasoning.
+                    // null result = Mode B (barline walk). Beat object = Mode A (nextBeat walk).
+                    let scannedNextBeat: any = null;
+                    for (let t = expandedBeatStart + 1; t <= expandedBeatStart + 4000; t++) {
+                        const r = tickCache.findBeat(trackIndices, t);
+                        if (r?.beat && !isSameBeat(r.beat, curBeat)) {
+                            scannedNextBeat = r.beat;
+                            break;
+                        }
+                    }
+                    stableNextBeatRef.current = scannedNextBeat;
+                    cursorRef.current.setBeat(curBeat);
+                }
+
+                // Per-frame: O(1) — frozen cached values only.
+                // 🔒 tick is ALWAYS first arg (real engine position).
+                //    expandedBeatStart is ALWAYS third arg (beat-start reference only).
+                //    Swapping them zeros progress every frame → stepping.
+                cursorRef.current.setTick(tick, stableNextBeatRef.current, stableExpandedBeatStartRef.current);
             });
+            // 🔒🔒🔒 END CURSOR ENGINE LOCK 🔒🔒🔒
 
-            setApi(alphaTabApi);
-            (window as any).__at = alphaTabApi;
-
-            // Player ready detection
-            const checkPlayerReady = () => {
-                console.log('🔍 Player status:', {
-                    isReadyForPlayback: alphaTabApi.isReadyForPlayback,
-                    playerState: alphaTabApi.playerState,
-                    hasPlayer: !!alphaTabApi.player,
-                    hasOutput: !!alphaTabApi.player?.output,
-                });
-
-                if (alphaTabApi.isReadyForPlayback) {
-                    console.log('✅ Player ready!');
-                    setIsPlaying(alphaTabApi.playerState !== 0);
+            const checkReady = () => {
+                if (api.isReadyForPlayback) {
+                    if (DEBUG) console.log('✅ Player ready');
+                    setIsPlaying(api.playerState !== 0);
                     return true;
                 }
                 return false;
             };
 
-            // playerReady event
-            if (alphaTabApi.playerReady) {
-                console.log('📡 playerReady event found');
-                alphaTabApi.playerReady.on(() => {
-                    console.log('✅ playerReady event fired!');
-                    setTimeout(checkPlayerReady, 100);
-                });
-            }
+            api.playerReady?.on(() => setTimeout(checkReady, 100));
 
-            // Poll for 15 seconds
-            let pollCount = 0;
-            const maxPolls = 15;
-            const pollInterval = setInterval(() => {
-                pollCount++;
-                console.log(`🔄 Poll ${pollCount}/${maxPolls}...`);
-
-                if (checkPlayerReady()) {
-                    clearInterval(pollInterval);
-                } else if (pollCount >= maxPolls) {
-                    console.error('❌ Timeout - soundfont failed to load!');
-                    console.error('🔍 Debug checklist:');
-                    console.error('  1. File exists: /public/soundfont/sonivox.sf2');
-                    console.error('  2. Check Network tab for 404 errors');
-                    console.error('  3. Check file size (should be ~2-3MB)');
-                    console.error('  4. Check browser console for CORS errors');
-                    clearInterval(pollInterval);
-                    setSoundfontStatus('error');
-                    setForceReady(true);
+            let polls = 0;
+            const pollId = setInterval(() => {
+                polls++;
+                if (checkReady() || polls >= 15) {
+                    clearInterval(pollId);
+                    if (polls >= 15 && !api.isReadyForPlayback) {
+                        console.error('❌ Soundfont load timeout');
+                        setSoundfontStatus('error');
+                        setForceReady(true);
+                    }
                 }
             }, 1000);
-
-            const cleanup = setTimeout(() => {
-                clearInterval(pollInterval);
-            }, 16000);
-
-            return () => {
-                clearInterval(pollInterval);
-                clearTimeout(cleanup);
-            };
         };
 
-        initAlphaTab().catch(console.error);
+        init().catch(console.error);
 
         return () => {
             destroyed = true;
-
-            // Destroy cursor
-            if (cursorRef.current) {
-                cursorRef.current.destroy();
-                cursorRef.current = null;
-            }
-
-            if (api) {
-                api.destroy();
-            }
+            disableManualLoop();
+            if (cursorRef.current) { cursorRef.current.destroy(); cursorRef.current = null; }
+            if (apiRef.current) { apiRef.current.destroy(); apiRef.current = null; }
         };
     }, []);
 
-    // Check if soundfont file exists (diagnostic)
     useEffect(() => {
-        console.log('🔍 Starting soundfont file accessibility check...');
         fetch('/soundfont/sonivox.sf2', { method: 'HEAD' })
-            .then(response => {
-                console.log('🔍 Soundfont HEAD response:', {
-                    ok: response.ok,
-                    status: response.status,
-                    statusText: response.statusText,
-                    size: response.headers.get('content-length'),
-                    type: response.headers.get('content-type'),
-                });
-                if (response.ok) {
-                    console.log('✅ Soundfont file is accessible at /soundfont/sonivox.sf2');
-                } else {
-                    console.error('❌ Soundfont returned error:', response.status, response.statusText);
-                }
-            })
-            .catch(err => {
-                console.error('❌ Soundfont file fetch failed:', err);
-                console.error('   This usually means the file path is wrong or server not running');
-            });
+            .then(r => r.ok
+                ? (DEBUG && console.log('✅ Soundfont accessible'))
+                : console.error(`❌ Soundfont ${r.status}`))
+            .catch(err => console.error('❌ Soundfont fetch failed:', err));
     }, []);
 
-    const handleSeek = () => {
-        if (!api || !boundsReady) {
-            console.warn('⚠️ Cannot seek - not ready');
-            return;
-        }
+    // Click-to-seek (native interaction disabled)
+    useEffect(() => {
+        const api = apiRef.current;
+        const surface = surfaceRef.current;
+        if (!api || !surface || !boundsReady) return;
 
-        const targetTick = 10000;
-        console.log(`🎯 Seek to tick ${targetTick}`);
-        api.tickPosition = targetTick;
-
-        // 🔥 CRITICAL: Manually update cursor on seek
-        if (cursorRef.current) {
-            const trackIndices = api.tracks
-                ? new Set(api.tracks.map((t: any) => t.index))
-                : new Set([0]);
-
+        const handleClick = (e: MouseEvent) => {
+            if (loopEnabled) return;
+            const rect = surface.getBoundingClientRect();
+            const scrollElement = api.renderer?.framer?.scrollElement as HTMLElement | undefined;
+            const scrollX = scrollElement?.scrollLeft ?? surface.scrollLeft ?? 0;
+            const scrollY = scrollElement?.scrollTop ?? surface.scrollTop ?? 0;
+            const x = (e.clientX - rect.left) + scrollX;
+            const y = (e.clientY - rect.top) + scrollY;
+            const beat = api.renderer?.boundsLookup?.getBeatAtPos?.(x, y);
             const tickCache = (api as any).tickCache;
-            if (tickCache) {
-                const beatResult = tickCache.findBeat(trackIndices, targetTick);
-                if (beatResult?.beat && api.renderer?.boundsLookup) {
-                    const beatBounds = api.renderer.boundsLookup.findBeat(beatResult.beat);
-                    if (beatBounds?.visualBounds) {
-                        cursorRef.current.update(beatResult.beat, {
-                            x: beatBounds.visualBounds.x,
-                            y: beatBounds.visualBounds.y,
-                            w: beatBounds.visualBounds.w,
-                            h: beatBounds.visualBounds.h
-                        });
-                    }
-                }
-            }
-        }
+            if (!beat || !tickCache?.masterBars) return;
+
+            const visualBarIndex = beat.voice?.bar?.masterBar?.index;
+            if (visualBarIndex == null) return;
+            const offsetInBar = beat.playbackStart ?? 0;
+            const currentTick = api.tickPosition ?? 0;
+
+            const instances = tickCache.masterBars.filter(
+                (mb: any) => mb.masterBar?.index === visualBarIndex
+            );
+            if (instances.length === 0) return;
+
+            const candidates = instances.map((mb: any) => mb.start + offsetInBar);
+            const trueTargetTick = candidates.reduce((prev: number, curr: number) =>
+                Math.abs(curr - currentTick) < Math.abs(prev - currentTick) ? curr : prev
+            );
+
+            console.log(`🎯 Repeat-Aware Seek: Visual M${visualBarIndex} → Expanded ${trueTargetTick}`);
+            const wasPlaying = api.playerState !== 0;
+            if (wasPlaying) api.pause();
+            api.tickPosition = trueTargetTick;
+            // Do NOT call updateCursorForTick here — findBeat() returns pass-1 beat.
+            // Let playerPositionChanged drive cursor after seek.
+            if (wasPlaying) requestAnimationFrame(() => api.play());
+        };
+
+        surface.addEventListener('click', handleClick);
+        return () => surface.removeEventListener('click', handleClick);
+    }, [boundsReady, loopEnabled]);
+
+    // ─────────────────────────────────────────
+    // Controls
+    // ─────────────────────────────────────────
+
+    const handleSeek = () => {
+        const api = apiRef.current;
+        if (!api || !boundsReady) return;
+        const tick = 10000;
+        const wasPlaying = api.playerState !== 0;
+        if (wasPlaying) api.pause();
+        api.tickPosition = tick;
+        updateCursorForTick(api, tick);
+        if (wasPlaying) requestAnimationFrame(() => api.play());
     };
 
     const handleTogglePlay = () => {
-        if (!api) {
-            console.warn('⚠️ API not ready');
-            return;
-        }
-
-        if (!api.isReadyForPlayback && !forceReady) {
-            console.warn('⚠️ Player not ready');
-            return;
-        }
-
-        if (isPlaying) {
-            console.log('⏸️ Pause');
-            api.pause();
-        } else {
-            console.log('▶️ Play');
-            api.play();
-        }
+        const api = apiRef.current;
+        if (!api) return;
+        if (!api.isReadyForPlayback && !forceReady) return;
+        if ((api as any)._lastManualToggle) (api as any)._lastManualToggle();
+        const newState = !isPlaying;
+        console.log(`🎵 Toggle play: ${isPlaying} → ${newState}`);
+        if (newState) { api.play(); } else { api.pause(); }
+        setIsPlaying(newState);
     };
+
+    const playerReady = apiRef.current?.isReadyForPlayback || forceReady;
+
+    // ─────────────────────────────────────────
+    // Render
+    // ─────────────────────────────────────────
 
     return (
         <div style={{ padding: '20px', fontFamily: 'monospace' }}>
-            {/* Debug Controls */}
             <div style={{
-                position: 'fixed',
-                top: 20,
-                right: 20,
-                background: '#fff',
-                border: '2px solid #000',
-                padding: '15px',
-                zIndex: 10000,
-                borderRadius: '8px',
-                maxWidth: '300px',
+                position: 'fixed', top: 20, right: 20,
+                background: '#fff', border: '2px solid #000',
+                padding: '15px', zIndex: 10000, borderRadius: '8px', maxWidth: '300px',
             }}>
-                <h3 style={{ margin: '0 0 10px 0', fontSize: '14px' }}>🔴 v3.5 - Hybrid + Red Native</h3>
+                <h3 style={{ margin: '0 0 10px 0', fontSize: '14px' }}>
+                    🧪 v5.30 — Stable Repeat + Loop Cursor Engine
+                </h3>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    <button
-                        onClick={handleSeek}
-                        disabled={!boundsReady}
-                        style={{
-                            padding: '8px',
-                            fontSize: '12px',
-                            cursor: boundsReady ? 'pointer' : 'not-allowed',
-                            background: boundsReady ? '#4caf50' : '#ccc',
-                            color: 'white',
-                            border: 'none',
-                            borderRadius: '4px',
-                        }}
-                    >
-                        🎯 Seek
-                    </button>
-                    <button
-                        onClick={handleTogglePlay}
-                        disabled={!api?.isReadyForPlayback && !forceReady}
-                        style={{
-                            padding: '8px',
-                            fontSize: '12px',
-                            cursor: (api?.isReadyForPlayback || forceReady) ? 'pointer' : 'not-allowed',
-                            background: (api?.isReadyForPlayback || forceReady) ? '#2196f3' : '#ccc',
-                            color: 'white',
-                            border: 'none',
-                            borderRadius: '4px',
-                        }}
-                    >
-                        {isPlaying ? '⏸️ Pause' : '▶️ Play'}
-                    </button>
+                    <button onClick={handleSeek} disabled={!boundsReady} style={{
+                        padding: '8px', fontSize: '12px',
+                        cursor: boundsReady ? 'pointer' : 'not-allowed',
+                        background: boundsReady ? '#4caf50' : '#ccc',
+                        color: 'white', border: 'none', borderRadius: '4px',
+                    }}>🎯 Seek (tick 10000)</button>
+                    <button onClick={handleTogglePlay} disabled={!playerReady} style={{
+                        padding: '8px', fontSize: '12px',
+                        cursor: playerReady ? 'pointer' : 'not-allowed',
+                        background: playerReady ? '#2196f3' : '#ccc',
+                        color: 'white', border: 'none', borderRadius: '4px',
+                    }}>{isPlaying ? '⏸️ Pause' : '▶️ Play'}</button>
                     <div style={{
-                        fontSize: '11px',
-                        marginTop: '10px',
-                        padding: '8px',
-                        background: '#f5f5f5',
-                        borderRadius: '4px',
+                        fontSize: '11px', marginTop: '10px', padding: '8px',
+                        background: '#f5f5f5', borderRadius: '4px',
                     }}>
                         <div>Rendered: {isRendered ? '✅' : '❌'}</div>
                         <div>Bounds: {boundsReady ? '✅' : '❌'}</div>
-                        <div>Player: {api?.isReadyForPlayback ? '✅' : forceReady ? '⚠️' : '⏳'}</div>
-                        <div>Soundfont: {
-                            soundfontStatus === 'loaded' ? '✅' :
-                                soundfontStatus === 'error' ? '❌' :
-                                    '⏳'
-                        }</div>
-                        <div>Cycle: {renderCycle}</div>
+                        <div>Player: {apiRef.current?.isReadyForPlayback ? '✅' : forceReady ? '⚠️' : '⏳'}</div>
+                        <div>Soundfont: {soundfontStatus === 'loaded' ? '✅' : soundfontStatus === 'error' ? '❌' : '⏳'}</div>
                     </div>
-                    {soundfontStatus === 'error' && (
-                        <div style={{
-                            fontSize: '10px',
-                            padding: '8px',
-                            background: '#ffebee',
-                            borderRadius: '4px',
-                            color: '#c62828',
-                        }}>
-                            <strong>❌ Soundfont Failed</strong>
-                            <div>Check console & Network tab</div>
-                        </div>
-                    )}
                 </div>
             </div>
 
-            {/* Info */}
             <div style={{
-                background: '#fffbcc',
-                border: '2px solid #ff9800',
-                padding: '15px',
-                marginBottom: '20px',
-                borderRadius: '8px',
+                background: '#e8f5e9', border: '2px solid #4caf50',
+                padding: '15px', marginBottom: '20px', borderRadius: '8px',
             }}>
-                <h2 style={{ margin: '0 0 10px 0' }}>🔴 v3.5 - Hybrid Cursor + Native Red Cursor</h2>
-                <ul style={{ margin: 0 }}>
-                    <li>✅ ICursorHandler + Manual Updates</li>
-                    <li>✅ Moves during playback (playedBeatChanged)</li>
-                    <li>✅ Updates on click-to-seek</li>
-                    <li>✅ Updates on button seek</li>
-                    <li>✅ Perfectly centered custom cursor</li>
-                    <li>🔴 <strong>Native AlphaTab cursor ENABLED in RED</strong></li>
-                    <li>🔍 Compare custom vs. native cursor behavior</li>
-                </ul>
-                <div style={{
-                    marginTop: '10px',
-                    padding: '8px',
-                    background: '#ffebee',
-                    borderRadius: '4px',
-                    fontSize: '12px',
-                }}>
-                    <strong>🔴 What to Look For:</strong>
-                    <ul style={{ margin: '5px 0', paddingLeft: '20px' }}>
-                        <li><strong>Red cursor</strong> = Native AlphaTab cursor</li>
-                        <li><strong>Custom cursor</strong> = Your MaestroCursor</li>
-                        <li>Watch for drift/sync differences during playback</li>
-                        <li>Compare positioning on click-to-seek</li>
-                    </ul>
-                </div>
-                <div style={{
-                    marginTop: '10px',
-                    padding: '8px',
-                    background: '#e3f2fd',
-                    borderRadius: '4px',
-                    fontSize: '12px',
-                }}>
-                    <strong>📂 Required Files:</strong>
-                    <pre style={{ margin: '5px 0', fontSize: '11px' }}>{`
-/alphaTab (repo root)
-├── /public
-│   └── /soundfont
-│       └── sonivox.sf2  ⬅️ Required!
-└── /src
-    ├── /app
-    │   ├── page.tsx (original)
-    │   ├── alphaTab.css ⬅️ Red cursor styles
-    │   └── [new-page].tsx (this file)
-    └── /components/
-        └── MaestroCursor.tsx
-
-Note: Fonts loaded from CDN automatically
-                    `}</pre>
+                <h2 style={{ margin: '0 0 10px 0' }}>🎸 v5.30 — Stable Repeat + Loop Cursor Engine</h2>
+                <div style={{ fontSize: '13px', lineHeight: '1.6' }}>
+                    ✅ <strong>Smooth walk</strong> — no stepping, no drift<br />
+                    ✅ <strong>Repeat-aware</strong> — masterBars occurrence traversal<br />
+                    ✅ <strong>O(1) per frame</strong> — both scans gated by isSameBeat()<br />
+                    ✅ <strong>Zero-hiccup</strong> loop wrapping at boundaries
                 </div>
             </div>
 
-            {/* AlphaTab Container */}
-            <div
-                ref={containerRef}
-                style={{
-                    position: 'relative',
-                    width: '100%',
-                    minHeight: '600px',
-                    background: '#fff',
-                    overflow: 'visible',
-                }}
-            >
-                {/* Both cursors will be visible: 
-                    - Red native cursor (via AlphaTab settings + CSS)
-                    - Custom MaestroCursor (via ICursorHandler) */}
+            <div ref={containerRef} style={{
+                position: 'relative', width: '100%',
+                minHeight: '600px', background: '#fff', overflow: 'visible',
+            }}>
+                {apiRef.current && surfaceReady && (
+                    <BeatCustomLoopOverlay
+                        api={apiRef.current}
+                        loopEnabled={loopEnabled}
+                        onLoopToggle={(enabled) => {
+                            setLoopEnabled(enabled);
+                            loopEnabledRef.current = enabled;
+                            const api = apiRef.current;
+                            if (!api) return;
+                            if (enabled) {
+                                api.isLooping = true;
+                            } else {
+                                disableManualLoop();
+                                api.isLooping = false;
+                                api.playbackRange = null;
+                            }
+                        }}
+                        onLoopChange={(startTick, endTick) => {
+                            setPersistedLoop({ startTick, endTick });
+                        }}
+                        onLoopClear={() => {
+                            setPersistedLoop(null);
+                        }}
+                    />
+                )}
             </div>
         </div>
     );
