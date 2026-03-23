@@ -12,6 +12,9 @@
  * - Jump detection guards whammy re-sync / repeat / seek discontinuities
  *
  * See /docs/maestro-cursor-postmortem.md for full version history.
+ *
+ * v5.30.1 — Song selector added (Rise + SRV Pride and Joy).
+ * No engine changes from v5.30.
  */
 
 import React, { useEffect, useRef, useState } from 'react';
@@ -21,6 +24,19 @@ import BeatCustomLoopOverlay from '../components/BeatCustomLoopOverlay';
 import './alphaTab.css';
 
 const DEBUG = false;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Song config
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LAB_SONGS = [
+    { id: 'rise', label: 'Rise',               path: '/samples/extreme-rise/extreme-rise.gp5',           trackIndex: 0 },
+    { id: 'srv',  label: 'SRV - Pride and Joy', path: '/samples/srv-pride-and-joy/srv-pride-and-joy.gp',  trackIndex: 1 },
+] as const;
+
+type SongId = typeof LAB_SONGS[number]['id'];
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default function AlphaTabLabsPage() {
     const containerRef = useRef<HTMLDivElement>(null);
@@ -35,6 +51,7 @@ export default function AlphaTabLabsPage() {
     const stableExpandedBeatStartRef = useRef<number>(0);      // frozen beat start tick
     const stableNextBeatRef = useRef<any>(null);               // frozen next beat (null = Mode B)
 
+    const [selectedSongId, setSelectedSongId] = useState<SongId>('rise');
     const [isRendered, setIsRendered] = useState(false);
     const [isPlaying, setIsPlaying] = useState(false);
     const [forceReady, setForceReady] = useState(false);
@@ -117,13 +134,44 @@ export default function AlphaTabLabsPage() {
     }
 
     // ─────────────────────────────────────────
+    // Tear down existing AlphaTab instance
+    // ─────────────────────────────────────────
+
+    function teardown() {
+        disableManualLoop();
+        if (cursorRef.current) { cursorRef.current.destroy(); cursorRef.current = null; }
+        if (apiRef.current) { apiRef.current.destroy(); apiRef.current = null; }
+        surfaceRef.current = null;
+        lastTickRef.current = null;
+        stableCurBeatRef.current = null;
+        stableExpandedBeatStartRef.current = 0;
+        stableNextBeatRef.current = null;
+    }
+
+    // ─────────────────────────────────────────
     // Initialize AlphaTab
     // ─────────────────────────────────────────
 
     useEffect(() => {
-        if (!containerRef.current || apiRef.current) return;
+        if (!containerRef.current) return;
+
+        // Tear down any previous instance before starting fresh
+        teardown();
+
+        // Reset UI state for the new load cycle
+        setIsRendered(false);
+        setIsPlaying(false);
+        setForceReady(false);
+        setBoundsReady(false);
+        setSurfaceReady(false);
+        setSoundfontStatus('loading');
+        setLoopEnabled(false);
+        setPersistedLoop(null);
+        loopEnabledRef.current = false;
 
         let destroyed = false;
+
+        const selectedSong = LAB_SONGS.find(s => s.id === selectedSongId)!;
 
         const init = async () => {
             const alphaTab = await import('@coderline/alphatab');
@@ -156,9 +204,19 @@ export default function AlphaTabLabsPage() {
             apiRef.current = api;
             (window as any).__at = api;
 
-            const response = await fetch('/samples/extreme-rise/extreme-rise.gp5');
+            const response = await fetch(selectedSong.path);
             const arrayBuffer = await response.arrayBuffer();
             api.load(new Uint8Array(arrayBuffer));
+
+            // Render the correct track for this song
+            api.scoreLoaded.on(() => {
+                if (DEBUG) console.log('✅ Score loaded');
+                const score = api.score;
+                const tracks = score?.tracks;
+                if (tracks && tracks.length > selectedSong.trackIndex) {
+                    api.renderTracks([tracks[selectedSong.trackIndex]]);
+                }
+            });
 
             setTimeout(() => {
                 if (!containerRef.current) return;
@@ -170,7 +228,6 @@ export default function AlphaTabLabsPage() {
                 }
             }, 200);
 
-            api.scoreLoaded.on(() => { if (DEBUG) console.log('✅ Score loaded'); });
             api.renderStarted.on(() => { setBoundsReady(false); });
 
             api.renderFinished.on(() => {
@@ -453,11 +510,9 @@ export default function AlphaTabLabsPage() {
 
         return () => {
             destroyed = true;
-            disableManualLoop();
-            if (cursorRef.current) { cursorRef.current.destroy(); cursorRef.current = null; }
-            if (apiRef.current) { apiRef.current.destroy(); apiRef.current = null; }
+            teardown();
         };
-    }, []);
+    }, [selectedSongId]);
 
     useEffect(() => {
         fetch('/soundfont/sonivox.sf2', { method: 'HEAD' })
@@ -540,6 +595,7 @@ export default function AlphaTabLabsPage() {
     };
 
     const playerReady = apiRef.current?.isReadyForPlayback || forceReady;
+    const selectedSong = LAB_SONGS.find(s => s.id === selectedSongId)!;
 
     // ─────────────────────────────────────────
     // Render
@@ -553,8 +609,28 @@ export default function AlphaTabLabsPage() {
                 padding: '15px', zIndex: 10000, borderRadius: '8px', maxWidth: '300px',
             }}>
                 <h3 style={{ margin: '0 0 10px 0', fontSize: '14px' }}>
-                    🧪 v5.30 — Stable Repeat + Loop Cursor Engine
+                    🧪 v5.30 — {selectedSong.label}
                 </h3>
+
+                {/* ── Song selector ─────────────────────────────────────────────── */}
+                <div style={{ marginBottom: '10px' }}>
+                    {LAB_SONGS.map(song => (
+                        <button
+                            key={song.id}
+                            onClick={() => { setSurfaceReady(false); setSelectedSongId(song.id); }}
+                            style={{
+                                padding: '6px 10px', fontSize: '11px', border: 'none',
+                                borderRadius: '4px', cursor: 'pointer', marginRight: '6px',
+                                marginBottom: '4px', fontFamily: 'monospace',
+                                background: song.id === selectedSongId ? '#6a1b9a' : '#888',
+                                color: '#fff',
+                            }}
+                        >
+                            {song.label}
+                        </button>
+                    ))}
+                </div>
+
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                     <button onClick={handleSeek} disabled={!boundsReady} style={{
                         padding: '8px', fontSize: '12px',
@@ -593,13 +669,18 @@ export default function AlphaTabLabsPage() {
                 </div>
             </div>
 
-            <div ref={containerRef} style={{
-                position: 'relative', width: '100%',
-                minHeight: '600px', background: '#fff', overflow: 'visible',
-            }}>
+            {/* key={selectedSongId} forces React to fully unmount this subtree before
+                the new song boots — prevents removeChild conflict between AlphaTab's
+                api.destroy() and React trying to remove the overlay from the same div. */}
+            <div key={selectedSongId} style={{ position: 'relative' }}>
+                <div ref={containerRef} style={{
+                    position: 'relative', width: '100%',
+                    minHeight: '600px', background: '#fff', overflow: 'visible',
+                }} />
                 {apiRef.current && surfaceReady && (
                     <BeatCustomLoopOverlay
                         api={apiRef.current}
+                        container={containerRef.current}
                         loopEnabled={loopEnabled}
                         onLoopToggle={(enabled) => {
                             setLoopEnabled(enabled);
